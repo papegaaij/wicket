@@ -20,10 +20,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.commons.collections4.map.LinkedMap;
 import org.apache.wicket.core.util.string.ComponentStrings;
 import org.apache.wicket.markup.ComponentTag;
 import org.apache.wicket.markup.IMarkupFragment;
@@ -121,6 +122,22 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 */
 	private Object children;
 
+	private static class RemovedChild
+	{
+		private Component removedChild;
+		private Component prevSibling;
+
+		private RemovedChild(Component removedChild, Component prevSibling)
+		{
+			this.removedChild = removedChild;
+			this.prevSibling = prevSibling;
+		}
+	}
+
+	private transient int modCounter = 0;
+
+	private transient List<RemovedChild> removals = null;
+
 	/**
 	 * @see org.apache.wicket.Component#Component(String)
 	 */
@@ -194,7 +211,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			}
 
 			// Add the child to my children 
-			Component previousChild = put(child);
+			Component previousChild = children_put(child);
 			if (previousChild != null)
 			{
 				throw new IllegalArgumentException(
@@ -506,7 +523,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		}
 
 		// Add to map
-		put(child);
+		children_put(child);
 		addedComponent(child);
 	}
 
@@ -514,23 +531,26 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 * @return Iterator that iterates through children in the order they were added
 	 */
 	@Override
-	@SuppressWarnings("unchecked")
 	public Iterator<Component> iterator()
 	{
 		return new Iterator<Component>()
 		{
+			int indexInRemovalsSinceLastUpdate = removals_size();
+			int expectedModCounter = -1;
 			Component currentComponent = null;
-			Iterator<Component> internalIterator = copyChildren().iterator();
+			Iterator<Component> internalIterator = null;
 
 			@Override
 			public boolean hasNext()
 			{
+				refreshInternalIteratorIfNeeded();
 				return internalIterator.hasNext();
 			}
 
 			@Override
 			public Component next()
 			{
+				refreshInternalIteratorIfNeeded();
 				return currentComponent = internalIterator.next();
 			}
 
@@ -543,10 +563,66 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 				}
 				else
 				{
-					internalIterator.remove();
+					children_remove(currentComponent);
 				}
 				checkHierarchyChange(currentComponent);
 				removedComponent(currentComponent);
+			}
+
+			@SuppressWarnings("unchecked")
+			private void refreshInternalIteratorIfNeeded()
+			{
+				if (expectedModCounter == modCounter)
+					return;
+
+				if (children == null)
+				{
+					internalIterator = Collections.emptyIterator();
+				}
+				else if (children instanceof Component)
+				{
+					internalIterator = Collections.singleton((Component)children).iterator();
+				}
+				else if (children instanceof List)
+				{
+					internalIterator = ((List<Component>)children).iterator();
+				}
+				else
+				{
+					internalIterator = ((Map<String, Component>)children).values().iterator();
+				}
+
+				currentComponent = findLastExistingChildAlreadyReturned(currentComponent);
+				expectedModCounter = modCounter;
+				indexInRemovalsSinceLastUpdate = removals_size();
+			}
+
+			private Component findLastExistingChildAlreadyReturned(Component target)
+			{
+				if (target == null)
+					return null;
+
+				while (true)
+				{
+					RemovedChild removedChild = null;
+					for (int i = indexInRemovalsSinceLastUpdate; i < removals_size(); i++)
+					{
+						RemovedChild curRemovedChild = removals_get(i);
+						if (curRemovedChild.removedChild == target)
+						{
+							removedChild = curRemovedChild;
+							break;
+						}
+					}
+					if (removedChild == null)
+					{
+						return target;
+					}
+					else
+					{
+						target = removedChild.prevSibling;
+					}
+				}
 			}
 		};
 	}
@@ -720,9 +796,8 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 
 		if (child.getParent() != this)
 		{
-			// Get the child component to replace
-			final Component replaced = children_get(child.getId());
-
+			final Component replaced = children_put(child);
+			
 			// Look up to make sure it was already in the map
 			if (replaced == null)
 			{
@@ -730,10 +805,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 					exceptionMessage("Cannot replace a component which has not been added: id='" +
 						child.getId() + "', component=" + child));
 			}
-			
-			// Add to map
-			put(child);
-			
+
 			// first remove the component.
 			removedComponent(replaced);
 
@@ -1059,6 +1131,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			{
 				Component oldChild = (Component)children;
 				children = null;
+				removals_add(oldChild, null);
 				return oldChild;
 			}
 			return null;
@@ -1068,30 +1141,59 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			@SuppressWarnings("unchecked")
 			List<Component> childrenList = (List<Component>)children;
 			Iterator<Component> it = childrenList.iterator();
+			Component prevChild = null;
 			while (it.hasNext())
 			{
 				Component child = it.next();
 				if (child.getId().equals(component.getId()))
 				{
 					it.remove();
+					removals_add(child, prevChild);
 					if (childrenList.size() == 1)
 					{
 						children = childrenList.get(0);
 					}
 					return child;
 				}
+				prevChild = child;
 			}
 			return null;
 		}
 
 		@SuppressWarnings("unchecked")
-		Map<String, Component> childrenMap = (Map<String, Component>)children;
-		Component oldChild = childrenMap.remove(component.getId());
-		if (childrenMap.size() == 1)
+		LinkedMap<String, Component> childrenMap = (LinkedMap<String, Component>)children;
+		if (childrenMap.containsKey(component.getId()))
 		{
-			children = childrenMap.values().iterator().next();
+			String prevSiblingId = childrenMap.previousKey(component.getId());
+			Component oldChild = childrenMap.remove(component.getId());
+			removals_add(oldChild, prevSiblingId == null ? null : childrenMap.get(prevSiblingId));
+			if (childrenMap.size() == 1)
+			{
+				children = childrenMap.values().iterator().next();
+			}
+			return oldChild;
 		}
-		return oldChild;
+		return null;
+	}
+
+	private void removals_add(Component removedChild, Component prevSibling)
+	{
+		modCounter++;
+		if (removals == null)
+		{
+			removals = new LinkedList<>();
+		}
+		removals.add(new RemovedChild(removedChild, prevSibling));
+	}
+
+	private RemovedChild removals_get(int i)
+	{
+		return removals.get(i);
+	}
+
+	private int removals_size()
+	{
+		return removals == null ? 0 : removals.size();
 	}
 
 	/**
@@ -1123,13 +1225,15 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 * @return Any component that was replaced
 	 */
 	@SuppressWarnings("unchecked")
-	private Component put(final Component child)
+	private Component children_put(final Component child)
 	{
 		if (children == null)
 		{
 			children = child;
+			modCounter++;
 			return null;
 		}
+
 		if (children instanceof Component)
 		{
 			Component oldChild = (Component)children;
@@ -1145,9 +1249,11 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 				newChildren.add(originalChild);
 				newChildren.add(child);
 				children = newChildren;
+				modCounter++;
 				return null;
 			}
 		}
+
 		if (children instanceof List)
 		{
 			List<Component> childrenList = (List<Component>)children;
@@ -1165,7 +1271,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			}
 			else
 			{
-				Map<String, Component> newChildren = new LinkedHashMap<>(MAPIFY_THRESHOLD * 2);
+				Map<String, Component> newChildren = new LinkedMap<>(MAPIFY_THRESHOLD * 2);
 				for (Component curChild : childrenList)
 				{
 					newChildren.put(curChild.getId(), curChild);
@@ -1173,9 +1279,16 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 				newChildren.put(child.getId(), child);
 				children = newChildren;
 			}
+			modCounter++;
 			return null;
 		}
-		return ((Map<String, Component>)children).put(child.getId(), child);
+
+		Component oldChild = ((Map<String, Component>)children).put(child.getId(), child);
+		if (oldChild == null)
+		{
+			modCounter++;
+		}
+		return oldChild;
 	}
 
 	/**
@@ -1656,6 +1769,9 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	protected void onDetach()
 	{
 		super.onDetach();
+
+		modCounter = 0;
+		removals = null;
 
 		if (queue != null && !queue.isEmpty())
 		{
